@@ -130,6 +130,41 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderId int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.Success = false
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
+		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+	}
+
+	reply.Term = rf.currentTerm
+	rf.role = "follower"
+	rf.persist()
+	rf.resetElectionTimer()
+	reply.Success = true
+}
+
+func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here.
@@ -263,10 +298,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-func randomElectionTimeout() time.Duration {
-	return time.Duration(300+rand.Intn(200)) * time.Millisecond
-}
-
 func (rf *Raft) ticker() {
 	for {
 		<-rf.electionTimer.C
@@ -339,11 +370,60 @@ func (rf *Raft) startElection() {
 							rf.matchIndex[i] = 0
 						}
 						rf.resetElectionTimer()
+						go rf.startHeartBeatLoop(rf.currentTerm)
 					}
 				}
 				rf.mu.Unlock()
 			}
-		}()
+		}(i)
+	}
+}
+
+func (rf *Raft) broadcastHeartBeat() {
+	rf.mu.Lock()
+	if rf.role != "leader" {
+		rf.mu.Unlock()
+		return
+	}
+	term := rf.currentTerm
+	rf.mu.Unlock()
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		// send HeartBeat to peer servers
+		go func(server int) {
+			args := AppendEntriesArgs{
+				Term:     term,
+				LeaderId: rf.me,
+			}
+			var reply AppendEntriesReply
+			if rf.sendAppendEntries(server, args, &reply) {
+				// now we get reply from other server
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.role = "follower"
+					rf.votedFor = -1
+					rf.persist()
+					rf.resetElectionTimer()
+				}
+			}
+		}(i)
+	}
+}
+
+func (rf *Raft) startHeartBeatLoop(term int) {
+	for {
+		rf.mu.Lock()
+		if rf.role != "leader" || rf.currentTerm != term {
+			rf.mu.Unlock()
+			return
+		}
+		rf.mu.Unlock()
+		rf.broadcastHeartBeat()
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -371,4 +451,8 @@ func (rf *Raft) resetElectionTimer() {
 		}
 	}
 	rf.electionTimer.Reset(rf.electionTimeOut)
+}
+
+func randomElectionTimeout() time.Duration {
+	return time.Duration(300+rand.Intn(200)) * time.Millisecond
 }
