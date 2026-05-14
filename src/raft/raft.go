@@ -131,8 +131,12 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -143,6 +147,7 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	reply.Success = false
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
@@ -152,11 +157,50 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 	}
-
 	reply.Term = rf.currentTerm
 	rf.role = "follower"
-	rf.persist()
 	rf.resetElectionTimer()
+
+	// check logs
+	if args.PrevLogIndex > len(rf.log) {
+		// no such log
+		return
+	}
+
+	if args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+		// leader should reduce nextIndex
+		return
+	}
+	errIdx := -1
+	for i := range args.Entries {
+		entry := args.Entries[i]
+		if entry.Index > len(rf.log) {
+			errIdx = i
+			break
+		}
+		index := rf.log[entry.Index-1].Index
+		term := rf.log[entry.Index-1].Term
+		if entry.Index == index && entry.Term == term {
+			continue
+		} else {
+			errIdx = i
+			break
+		}
+	}
+	if errIdx != -1 {
+		// log conflict or miss
+		entry := args.Entries[errIdx]
+		if entry.Index <= len(rf.log) {
+			// conflict
+			rf.log = rf.log[:entry.Index-1]
+		}
+		rf.log = append(rf.log, args.Entries[errIdx:]...)
+	}
+
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log))
+	}
+
 	reply.Success = true
 }
 
@@ -189,6 +233,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
+		rf.resetElectionTimer()
 		rf.persist()
 		return
 	}
@@ -391,19 +436,34 @@ func (rf *Raft) broadcastHeartBeat() {
 		if i == rf.me {
 			continue
 		}
-		// send HeartBeat to peer servers
+		// send HeartBeat and logs to peer servers
 		go func(server int) {
+			rf.mu.Lock()
+			nextIndex := rf.nextIndex[server]
+			prevLogIndex := nextIndex - 1
+			prevLogTerm := 0
+			if prevLogIndex > 0 {
+				prevLogTerm = rf.log[prevLogIndex-1].Term
+			}
+			entries := make([]LogEntry, len(rf.log[nextIndex-1:]))
+			copy(entries, rf.log[nextIndex-1:])
+			rf.mu.Unlock()
 			args := AppendEntriesArgs{
-				Term:     term,
-				LeaderId: rf.me,
+				Term:         term,
+				LeaderId:     rf.me,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: rf.commitIndex,
 			}
 			var reply AppendEntriesReply
 			if rf.sendAppendEntries(server, args, &reply) {
 				// now we get reply from other server
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
-				if reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
+				replyTerm := reply.Term
+				if replyTerm > rf.currentTerm {
+					rf.currentTerm = replyTerm
 					rf.role = "follower"
 					rf.votedFor = -1
 					rf.persist()
