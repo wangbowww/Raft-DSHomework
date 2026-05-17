@@ -62,11 +62,12 @@ type Raft struct {
 	votedFor    int
 	log         []LogEntry
 
-	// Volatile state on all servers:
+	// Volatile state on all servers: from 1
 	commitIndex int
 	lastApplied int
+	applyCh     chan ApplyMsg
 
-	// Volatile state on leaders:
+	// Volatile state on leaders: from 1
 	nextIndex  []int
 	matchIndex []int
 
@@ -133,7 +134,7 @@ type RequestVoteReply struct {
 type AppendEntriesArgs struct {
 	Term         int
 	LeaderId     int
-	PrevLogIndex int
+	PrevLogIndex int // from 1
 	PrevLogTerm  int
 	Entries      []LogEntry
 	LeaderCommit int
@@ -223,6 +224,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// update receiver
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
+		reply.Term = rf.currentTerm
 		rf.votedFor = -1
 		rf.role = "follower"
 		rf.persist()
@@ -324,6 +326,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = make([]LogEntry, 0)
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+	rf.applyCh = applyCh
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 	for i := range rf.peers {
@@ -336,6 +339,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionTimer = time.NewTimer(rf.electionTimeOut)
 
 	go rf.ticker()
+	go rf.applier()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -356,6 +360,24 @@ func (rf *Raft) ticker() {
 		// if it's follower or candidate, start election
 		rf.mu.Unlock()
 		rf.startElection()
+	}
+}
+
+func (rf *Raft) applier() {
+	for {
+		rf.mu.Lock()
+		if rf.commitIndex > rf.lastApplied {
+			rf.lastApplied++
+			applyMsg := ApplyMsg{
+				Index:   rf.lastApplied,
+				Command: rf.log[rf.lastApplied-1].Command,
+			}
+			rf.mu.Unlock()
+			rf.applyCh <- applyMsg
+		} else {
+			rf.mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 }
 
@@ -447,7 +469,6 @@ func (rf *Raft) broadcastHeartBeat() {
 			}
 			entries := make([]LogEntry, len(rf.log[nextIndex-1:]))
 			copy(entries, rf.log[nextIndex-1:])
-			rf.mu.Unlock()
 			args := AppendEntriesArgs{
 				Term:         term,
 				LeaderId:     rf.me,
@@ -457,10 +478,15 @@ func (rf *Raft) broadcastHeartBeat() {
 				LeaderCommit: rf.commitIndex,
 			}
 			var reply AppendEntriesReply
+			rf.mu.Unlock()
 			if rf.sendAppendEntries(server, args, &reply) {
 				// now we get reply from other server
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
+				if rf.role != "leader" || rf.currentTerm != term {
+					// if it's not leader or term has changed, ignore the reply
+					return
+				}
 				replyTerm := reply.Term
 				if replyTerm > rf.currentTerm {
 					rf.currentTerm = replyTerm
@@ -468,6 +494,32 @@ func (rf *Raft) broadcastHeartBeat() {
 					rf.votedFor = -1
 					rf.persist()
 					rf.resetElectionTimer()
+				} else if reply.Success == false {
+					// if fail, reduce nextIndex and retry
+					if rf.nextIndex[server] == nextIndex {
+						rf.nextIndex[server] = max(1, rf.nextIndex[server]-1)
+					}
+				} else {
+					// if success, update nextIndex and matchIndex
+					newMatchIndex := prevLogIndex + len(entries)
+					if newMatchIndex > rf.matchIndex[server] {
+						rf.matchIndex[server] = newMatchIndex
+						rf.nextIndex[server] = newMatchIndex + 1
+					}
+					// update commitIndex if there exists an N such that N > commitIndex,
+					// a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm
+					for N := len(rf.log); N > rf.commitIndex; N-- {
+						count := 1
+						for i := range rf.peers {
+							if i != rf.me && rf.matchIndex[i] >= N {
+								count++
+							}
+						}
+						if count > len(rf.peers)/2 && rf.log[N-1].Term == rf.currentTerm {
+							rf.commitIndex = N
+							break
+						}
+					}
 				}
 			}
 		}(i)
