@@ -1,6 +1,7 @@
 .PHONY: test-raft test-raft-election \
 		test-raft-fail-no-agree test-raft-concurrent-starts \
 		test-raft-rejoin test-raft-backup \ 
+		test-raft-persist \
 		fmt-raft vet-raft clean
 
 GO_ENV := GO111MODULE=off GOPATH=$(CURDIR)
@@ -22,6 +23,9 @@ test-raft-rejoin:
 
 test-raft-backup:
 	$(GO_ENV) go test raft -run Backup
+
+test-raft-persist:
+	$(GO_ENV) go test raft -run Persist
 
 fmt-raft:
 	gofmt -w src/raft
