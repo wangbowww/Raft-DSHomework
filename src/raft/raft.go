@@ -155,8 +155,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -179,11 +181,19 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	// check logs
 	if args.PrevLogIndex > len(rf.log) {
 		// no such log
+		reply.ConflictIndex = len(rf.log) + 1
+		reply.ConflictTerm = -1
 		return
 	}
 
 	if args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
 		// leader should reduce nextIndex
+		reply.ConflictIndex = args.PrevLogIndex
+		reply.ConflictTerm = rf.log[args.PrevLogIndex-1].Term
+		for reply.ConflictIndex > 1 &&
+			rf.log[reply.ConflictIndex-2].Term == reply.ConflictTerm {
+			reply.ConflictIndex--
+		}
 		return
 	}
 	errIdx := -1
@@ -511,7 +521,26 @@ func (rf *Raft) broadcastHeartBeat() {
 				} else if reply.Success == false {
 					// if fail, reduce nextIndex and retry
 					if rf.nextIndex[server] == nextIndex {
-						rf.nextIndex[server] = max(1, rf.nextIndex[server]-1)
+						if reply.ConflictTerm == -1 {
+							rf.nextIndex[server] = reply.ConflictIndex
+						} else {
+							idx := -1
+							for i := len(rf.log) - 1; i >= 0; i-- {
+								if rf.log[i].Term == reply.ConflictTerm {
+									idx = rf.log[i].Index
+									break
+								}
+							}
+
+							if idx != -1 {
+								rf.nextIndex[server] = idx + 1
+							} else {
+								rf.nextIndex[server] = reply.ConflictIndex
+							}
+						}
+						if rf.nextIndex[server] < 1 {
+							rf.nextIndex[server] = 1
+						}
 					}
 				} else {
 					// if success, update nextIndex and matchIndex
